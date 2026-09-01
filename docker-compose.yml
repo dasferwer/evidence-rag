@@ -1,0 +1,110 @@
+name: 08-evidence-rag
+
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  env_file:
+    - path: .env
+      required: false
+  environment: &app-environment
+    DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://evidencerag:evidencerag@database:5432/evidencerag}
+    RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672/}
+    LLM_PROVIDER: ${LLM_PROVIDER:-local}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+    EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+    CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
+    EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-384}
+    OUTBOX_POLL_SECONDS: ${OUTBOX_POLL_SECONDS:-0.5}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  depends_on:
+    database:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  database:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-evidencerag}
+      POSTGRES_USER: ${POSTGRES_USER:-evidencerag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-evidencerag}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-evidencerag} -d ${POSTGRES_DB:-evidencerag}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    ports:
+      - "15688:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  api:
+    <<: *app
+    command: ["uvicorn", "evidencerag.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      - "8081:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  dispatcher:
+    <<: *app
+    command: ["python", "-m", "evidencerag.dispatcher"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "evidencerag.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  test:
+    <<: *app
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    environment:
+      <<: *app-environment
+      DATABASE_URL: postgresql+asyncpg://evidencerag:evidencerag@database:5432/evidencerag
+    command: ["pytest"]
+    restart: "no"
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
