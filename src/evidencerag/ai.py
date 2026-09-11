@@ -12,7 +12,7 @@ TOKEN_RE = re.compile(r"[\w-]+", re.UNICODE)
 
 
 def local_embedding(text: str, dimension: int) -> list[float]:
-    """Deterministic feature hashing for an offline, reproducible demo mode."""
+    """Одинаковый текст даёт одинаковый вектор; демо работает без внешней модели."""
     vector = [0.0] * dimension
     tokens = TOKEN_RE.findall(text.casefold())
     for token in tokens:

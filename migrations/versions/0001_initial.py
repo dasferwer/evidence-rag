@@ -1,4 +1,4 @@
-"""Create EvidenceRAG schema.
+"""Создаём таблицы документов, фрагментов и заданий индексации.
 
 Revision ID: 0001
 Revises:

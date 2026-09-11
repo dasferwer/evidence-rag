@@ -16,7 +16,7 @@ def normalize_text(text: str) -> str:
 
 
 def chunk_text(text: str, *, max_chars: int = 1_200, overlap_chars: int = 180) -> list[TextChunk]:
-    """Split on paragraphs, then hard boundaries, preserving a small context overlap."""
+    """Делим по абзацам и оставляем перекрытие, чтобы не терять контекст на границе."""
     if overlap_chars >= max_chars:
         raise ValueError("overlap_chars must be lower than max_chars")
 
