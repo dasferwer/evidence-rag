@@ -18,7 +18,7 @@ dependencies = [
   "prometheus-client>=0.22,<1",
   "psycopg[binary]>=3.2,<4",
   "pydantic-settings>=2.10,<3",
-  "sqlalchemy>=2.0.40,<3",
+  "sqlalchemy[asyncio]>=2.0.40,<3",
   "uvicorn[standard]>=0.35,<1",
 ]
 

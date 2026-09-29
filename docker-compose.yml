@@ -18,6 +18,7 @@ x-app: &app
     EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-384}
     OUTBOX_POLL_SECONDS: ${OUTBOX_POLL_SECONDS:-0.5}
     LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    API_KEYS: '${API_KEYS:-{"demo":"local-demo-key-change-me"}}'
   depends_on:
     database:
       condition: service_healthy
@@ -44,7 +45,7 @@ services:
   rabbitmq:
     image: rabbitmq:4-management-alpine
     ports:
-      - "15688:15672"
+      - "127.0.0.1:15688:15672"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
@@ -68,7 +69,7 @@ services:
       rabbitmq:
         condition: service_healthy
     ports:
-      - "8081:8000"
+      - "127.0.0.1:8081:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
@@ -93,6 +94,28 @@ services:
       rabbitmq:
         condition: service_healthy
 
+  database-test:
+    image: pgvector/pgvector:pg17
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: evidencerag_test
+      POSTGRES_USER: evidencerag
+      POSTGRES_PASSWORD: evidencerag
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evidencerag -d evidencerag_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq-test:
+    image: rabbitmq:4-alpine
+    profiles: ["test"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
   test:
     <<: *app
     profiles: ["test"]
@@ -101,8 +124,15 @@ services:
       target: test
     environment:
       <<: *app-environment
-      DATABASE_URL: postgresql+asyncpg://evidencerag:evidencerag@database:5432/evidencerag
-    command: ["pytest"]
+      DATABASE_URL: postgresql+asyncpg://evidencerag:evidencerag@database-test:5432/evidencerag_test
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq-test:5672/
+      API_KEYS: '{"test":"test-client-key-long","other":"other-client-key-long"}'
+    depends_on:
+      database-test:
+        condition: service_healthy
+      rabbitmq-test:
+        condition: service_healthy
+    command: ["sh", "-c", "alembic upgrade head && pytest"]
     restart: "no"
 
 volumes:

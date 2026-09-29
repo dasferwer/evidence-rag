@@ -1,114 +1,60 @@
 # EvidenceRAG
 
-Платформа ответов по внутренней базе знаний с проверяемыми цитатами,
-асинхронной индексацией и трассировкой каждого запроса. Это не обёртка над
-одним вызовом LLM: проект показывает полный RAG-конвейер, согласованную
-доставку заданий, гибридный поиск, защиту от инструкций внутри документов и
-контур оценки качества.
+Сервис ответов по базе знаний с цитатами, асинхронной индексацией и историей запросов. Это портфолио-проект: он показывает обработку документов и отказов, но не подтверждает работу под промышленной нагрузкой. Локальный режим использует детерминированные векторы и шаблонный ответ; приложение не обучает собственную модель.
 
-> English overview: a citation-first RAG backend built with FastAPI,
-> PostgreSQL/pgvector and RabbitMQ. It includes transactional ingestion,
-> vector retrieval with lexical reranking, provider abstraction, prompt
-> versioning, feedback and Prometheus metrics.
+## Возможности и устройство
 
-## Статус проекта
+- API-ключ определяет владельца баз знаний. Запросы к чужим базам, документам и оценкам возвращают `404`.
+- Повторная загрузка с тем же `source_key` и теми же данными возвращает существующий документ; другие данные дают `409`. Создание документа и события outbox выполняется в одной транзакции.
+- Редакция документа требует `If-Match` с номером поколения. Индексация использует аренду и проверяет поколение перед записью фрагментов, поэтому запоздавший воркер не может вернуть старый текст в поиск.
+- Dispatcher доставляет события в RabbitMQ с подтверждением публикации. Воркер восстанавливает задания из PostgreSQL даже при потере уведомления. Неверные уведомления отправляются в очередь ошибок.
+- Поиск объединяет кандидатов по косинусному расстоянию и полнотекстовому совпадению, затем ранжирует их. В ответе и истории запроса сохраняются цитаты с поколением документа.
+- Доступны оценки ответов, метрики Prometheus и проверки состояния приложения. Схема базы управляется Alembic.
 
-Проект создан как самостоятельная портфолио-работа для демонстрации изученных
-LLM/RAG-подходов. Он не заявляется как коммерческий опыт разработки моделей.
-Модель не обучается с нуля: приложение интегрирует готовый OpenAI-совместимый
-API либо использует воспроизводимый локальный режим.
+Основные компоненты: FastAPI, SQLAlchemy 2, PostgreSQL 17 с pgvector, RabbitMQ, aio-pika, Alembic, pytest, Ruff и mypy. Подробнее о согласованности и ограничениях — в [описании архитектуры](docs/architecture.md).
 
-## Что реализовано
-
-- базы знаний, документы и идемпотентная загрузка по `source_key`;
-- transactional outbox между PostgreSQL и RabbitMQ;
-- отдельные dispatcher и ingestion worker, publisher confirms и DLQ;
-- чанкинг с перекрытием и пакетное построение embeddings;
-- поиск кандидатов через pgvector и лексический reranking;
-- ответы только по найденным данным с обязательными цитатами;
-- защита промпта: инструкции из документов считаются недоверенными данными;
-- локальный deterministic provider без ключей и OpenAI-compatible provider;
-- query tracing: версия промпта, evidence, latency и используемый provider;
-- пользовательская оценка ответа и Prometheus-метрики;
-- Alembic, Docker health checks, тесты и end-to-end smoke-сценарий.
-
-## Стек
-
-Python 3.13, FastAPI, SQLAlchemy 2 async, PostgreSQL 17, pgvector, Alembic,
-RabbitMQ, aio-pika, Pydantic 2, HTTPX, Prometheus client, pytest, Ruff, mypy,
-Docker Compose.
-
-## Быстрый запуск
+## Запуск
 
 ```bash
 cp .env.example .env
 docker compose up --build -d
-docker compose ps
 python scripts/smoke.py
 ```
 
-Опциональные демонстрационные данные:
+Демонстрационный ключ — `local-demo-key-change-me`. Он задан только для локального Compose. Перед размещением сервиса вне локальной машины замените `API_KEYS`, пароль базы и настройки RabbitMQ. Порты API и панели RabbitMQ привязаны к `127.0.0.1`.
+
+API: <http://localhost:8081/docs>; готовность: <http://localhost:8081/ready>; метрики: <http://localhost:8081/metrics>; панель RabbitMQ: <http://localhost:15688> (`guest` / `guest`). Во всех рабочих запросах нужен заголовок `Authorization: Bearer <ключ>`.
+
+Для внешнего OpenAI-совместимого сервиса укажите `LLM_PROVIDER=openai`, `OPENAI_API_KEY` и при необходимости `OPENAI_BASE_URL`. Модель встраивания должна возвращать векторы размерности 384; смена размерности требует согласованного изменения схемы и переиндексации.
+
+Остановка без удаления данных: `docker compose down`.
+
+## Маршруты
+
+| Метод | Путь | Действие |
+|---|---|---|
+| `POST` | `/api/v1/knowledge-bases` | Создать базу знаний |
+| `GET` | `/api/v1/knowledge-bases` | Получить базы владельца |
+| `POST` | `/api/v1/knowledge-bases/{id}/documents` | Принять документ и задание индексации |
+| `GET` | `/api/v1/documents/{id}` | Получить состояние документа |
+| `PUT` | `/api/v1/documents/{id}` | Изменить документ с `If-Match: "1"` |
+| `POST` | `/api/v1/knowledge-bases/{id}/query` | Получить ответ с цитатами |
+| `POST` | `/api/v1/traces/{id}/feedback` | Оценить ответ |
+| `GET` | `/api/v1/knowledge-bases/{id}/stats` | Получить статистику базы |
+
+При обновлении существующей установки миграция относит прежние базы к владельцу `legacy`. Добавьте для него отдельный ключ в `API_KEYS` или назначьте владельцев после проверки прав на эти данные.
+
+## Проверки
 
 ```bash
-docker compose exec api python -m evidencerag.seed
-```
-
-После запуска:
-
-- Swagger UI: <http://localhost:8081/docs>
-- health check: <http://localhost:8081/health>
-- Prometheus metrics: <http://localhost:8081/metrics>
-- RabbitMQ UI: <http://localhost:15688> (`guest` / `guest`)
-
-По умолчанию используется `LLM_PROVIDER=local`, поэтому проект полностью
-работает без внешних ключей. Для реального OpenAI-совместимого endpoint нужно
-заполнить `OPENAI_API_KEY` и установить `LLM_PROVIDER=openai`.
-
-Остановка:
-
-```bash
-docker compose down
-```
-
-## Quality gate
-
-```bash
-docker compose --profile test run --rm test
-docker compose config --quiet
-```
-
-Локально через uv:
-
-```bash
-uv sync --extra dev
+uv sync --frozen --extra dev
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy src
 uv run pytest
+docker compose config --quiet
+docker compose --profile test build test
+docker compose --profile test run --rm test
 ```
 
-## Основные маршруты
-
-| Метод | Маршрут | Назначение |
-|---|---|---|
-| `POST` | `/api/v1/knowledge-bases` | создать базу знаний |
-| `POST` | `/api/v1/knowledge-bases/{id}/documents` | принять документ и outbox event |
-| `GET` | `/api/v1/documents/{id}` | проверить статус индексации |
-| `POST` | `/api/v1/knowledge-bases/{id}/query` | получить ответ и citations |
-| `POST` | `/api/v1/traces/{id}/feedback` | сохранить оценку ответа |
-| `GET` | `/api/v1/knowledge-bases/{id}/stats` | получить агрегаты базы |
-
-Архитектура, модель согласованности и отказные сценарии описаны в
-[docs/architecture.md](docs/architecture.md). English documentation is
-available in [README.en.md](README.en.md).
-
-## Repository map
-
-```text
-src/evidencerag/       API, retrieval, providers, dispatcher, worker and seed
-migrations/            PostgreSQL and pgvector schema
-tests/                 deterministic unit tests
-scripts/smoke.py       real asynchronous end-to-end scenario
-docs/architecture.md   diagrams, consistency and failure analysis
-docker-compose.yml     database, RabbitMQ, API, dispatcher and worker
-```
+Локальный `pytest` запускает независимые тесты и пропускает интеграционные без отдельной базы `evidencerag_test`. Контейнерная проверка поднимает изолированные PostgreSQL и RabbitMQ, применяет миграции и выполняет все тесты. CI повторяет эти проверки. Сквозной `scripts/smoke.py` дополнительно проверяет API, воркер, поиск и оценку ответа на запущенном составе сервисов.

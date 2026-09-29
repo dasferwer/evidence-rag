@@ -2,7 +2,7 @@ import re
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from evidencerag.models import Chunk, Document, DocumentStatus
@@ -13,6 +13,7 @@ WORD_RE = re.compile(r"[\w-]+", re.UNICODE)
 @dataclass(frozen=True, slots=True)
 class RetrievedChunk:
     document_id: UUID
+    generation: int
     title: str
     source_key: str
     ordinal: int
@@ -43,26 +44,47 @@ async def retrieve(
     top_k: int,
 ) -> list[RetrievedChunk]:
     distance = Chunk.embedding.cosine_distance(query_vector).label("distance")
-    statement = (
+    lexical = func.ts_rank_cd(
+        func.to_tsvector("simple", Chunk.text), func.plainto_tsquery("simple", query)
+    ).label("lexical_rank")
+    base = (
         select(Chunk, Document, distance)
         .join(Document, Document.id == Chunk.document_id)
         .where(
             Chunk.knowledge_base_id == knowledge_base_id,
             Document.status == DocumentStatus.ready,
+            Chunk.generation == Document.generation,
+            Document.indexed_generation == Document.generation,
         )
-        .order_by(distance)
-        .limit(candidates)
     )
-    rows = (await session.execute(statement)).all()
+    vector_rows = (await session.execute(base.order_by(distance).limit(candidates))).all()
+    lexical_rows = (
+        await session.execute(
+            base.where(
+                func.to_tsvector("simple", Chunk.text).op("@@")(
+                    func.plainto_tsquery("simple", query)
+                )
+            )
+            .order_by(lexical.desc(), Chunk.id)
+            .limit(candidates)
+        )
+    ).all()
+    merged = {
+        chunk.id: (chunk, document, vector_distance)
+        for chunk, document, vector_distance in [*vector_rows, *lexical_rows]
+    }
     reranked = [
         RetrievedChunk(
             document_id=document.id,
+            generation=document.generation,
             title=document.title,
             source_key=document.source_key,
             ordinal=chunk.ordinal,
             text=chunk.text,
             score=combined_score(query, chunk.text, float(vector_distance)),
         )
-        for chunk, document, vector_distance in rows
+        for chunk, document, vector_distance in merged.values()
     ]
-    return sorted(reranked, key=lambda item: item.score, reverse=True)[:top_k]
+    return sorted(reranked, key=lambda item: (-item.score, str(item.document_id), item.ordinal))[
+        :top_k
+    ]

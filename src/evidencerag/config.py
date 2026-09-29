@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,11 +21,19 @@ class Settings(BaseSettings):
     top_k_max: int = Field(default=10, ge=1, le=20)
     outbox_poll_seconds: float = Field(default=0.5, ge=0.1, le=30)
     log_level: str = "INFO"
+    api_keys: dict[str, SecretStr] = Field(default_factory=dict)
+    ingestion_lease_seconds: int = Field(default=120, ge=10, le=600)
+    max_ingestion_attempts: int = Field(default=5, ge=1, le=10)
 
     @model_validator(mode="after")
     def validate_provider(self) -> "Settings":
+        keys = [secret.get_secret_value() for secret in self.api_keys.values()]
+        if any(not 1 <= len(owner) <= 100 for owner in self.api_keys):
+            raise ValueError("ID клиента должен содержать от 1 до 100 символов")
+        if any(len(key) < 16 for key in keys) or len(keys) != len(set(keys)):
+            raise ValueError("Ключи клиентов должны быть уникальными и не короче 16 символов")
         if self.llm_provider == "openai" and not self.openai_api_key:
-            raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
+            raise ValueError("Для LLM_PROVIDER=openai требуется OPENAI_API_KEY")
         return self
 
 

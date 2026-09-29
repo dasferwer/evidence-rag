@@ -1,47 +1,39 @@
-# EvidenceRAG architecture
+# Архитектура EvidenceRAG
 
 ```mermaid
 flowchart LR
-    Client --> API[FastAPI API]
-    API --> DB[(PostgreSQL + pgvector)]
-    API --> OUTBOX[Transactional outbox]
-    OUTBOX --> DISPATCHER[Outbox dispatcher]
-    DISPATCHER --> MQ[(RabbitMQ)]
-    MQ --> WORKER[Ingestion worker]
-    WORKER --> EMBED[Local or OpenAI embeddings]
-    WORKER --> DB
-    API --> RETRIEVE[Vector retrieval + lexical rerank]
-    RETRIEVE --> LLM[Local or OpenAI answer]
-    LLM --> TRACE[Answer, citations and trace]
-    TRACE --> DB
+    Client[Клиент] --> API[FastAPI]
+    API --> DB[(PostgreSQL и pgvector)]
+    DB --> Dispatcher[Диспетчер outbox]
+    Dispatcher --> MQ[(RabbitMQ)]
+    MQ --> Worker[Воркер индексации]
+    Worker --> DB
+    API --> Provider[Локальный или внешний провайдер]
+    Provider --> API
 ```
 
-## Consistency model
+## Владение и данные
 
-The API stores the document and its outbox event in one PostgreSQL transaction.
-The dispatcher publishes durable messages with publisher confirms. The worker is
-idempotent: a redelivered message for a ready document is acknowledged, while a
-reprocessed document replaces its chunks in one transaction. Unhandled consumer
-errors are routed to `rag.document.ingest.dlq`.
+API-ключ сопоставляется с идентификатором владельца из `API_KEYS`. Этот идентификатор хранится в базе знаний; доступ к документам, запросам и оценкам проверяется через неё. Отсутствие или недействительность ключа дают `401`, чужой объект — `404`. Ключи задаются в конфигурации и не сохраняются в базе. Такой способ годится для небольшого числа доверенных клиентов; ротация ключей, личные учётные записи и квоты потребуют отдельного контура управления доступом.
 
-## Retrieval pipeline
+Создание документа и запись события outbox происходят в одной транзакции. Составной уникальный ключ `knowledge_base_id, source_key` и транзакционная блокировка для этого ключа устраняют гонку повторной загрузки. Другой текст или заголовок с прежним ключом отклоняется. При редактировании клиент передаёт номер поколения в `If-Match`; блокировка строки и проверка номера не позволяют тихо затереть параллельную редакцию.
 
-1. Text is normalized and split with overlap.
-2. Embeddings are generated in batches.
-3. pgvector returns cosine-distance candidates.
-4. A lexical-overlap signal reranks the candidates.
-5. The answer prompt treats retrieved text as untrusted data and requires citations.
-6. Query traces store prompt version, provider, latency and retrieved evidence.
+Миграция 0002 назначает существующим базам владельца `legacy`. Администратор должен явно добавить этому владельцу ключ либо переназначить базы после проверки принадлежности. Обратная миграция запрещена, потому что она стёрла бы сведения о владельцах и поколениях.
 
-The offline provider is intentionally deterministic: it makes the repository
-fully testable without an API key. `LLM_PROVIDER=openai` enables an OpenAI-compatible
-embedding and chat endpoint.
+## Доставка и индексация
 
-## Failure scenarios
+Диспетчер выбирает неопубликованные события через `FOR UPDATE SKIP LOCKED` и отмечает их только после подтверждения RabbitMQ. Сбой после подтверждения и до фиксации БД вызывает повторную публикацию; это допустимо. PostgreSQL остаётся источником состояния задания: воркер периодически ищет документы, которым пора на индексацию, даже если уведомление пропало.
 
-- API crash before commit: neither the document nor event is visible.
-- Dispatcher crash after publish: the event can be published again; worker processing is idempotent.
-- Provider failure: document becomes `failed`, and the message is dead-lettered.
-- Reused source key with new content: API returns `409 Conflict`.
-- Missing evidence: answer explicitly reports insufficient data.
+Воркер захватывает документ короткой транзакцией и сохраняет токен аренды, номер поколения и число попыток. Построение векторов происходит вне транзакции. Перед заменой фрагментов воркер повторно блокирует строку и сверяет токен с поколением. Если документ изменился или другой воркер забрал просроченную аренду, прежний результат отбрасывается. Ошибки провайдера ведут к повтору с ограниченной задержкой; после пяти попыток документ получает статус `failed`. Новая редакция сбрасывает счётчик и создаёт новое задание. Некорректные уведомления отклоняются без повторной доставки и попадают в очередь ошибок через настройки RabbitMQ.
 
+Аренда длится 120 секунд по умолчанию. Долгая индексация может вызвать лишнюю повторную работу, но проверка токена предотвращает запись устаревших фрагментов. Если БД недоступна, завершить индексацию и сохранить ошибку невозможно; после восстановления задача станет доступна по истечении аренды.
+
+## Поиск и ответы
+
+Поиск объединяет наиболее подходящие фрагменты по косинусному расстоянию pgvector и полнотекстовому поиску PostgreSQL, затем применяет комбинированную оценку. Он видит лишь документы в состоянии `ready`, у которых поколение фрагмента и проиндексированное поколение совпадают с текущим. Пока идёт переиндексация новой редакции, документ из поиска исключён.
+
+После вызова провайдера API заново проверяет поколения найденных документов под блокировкой строк, прежде чем сохранить историю ответа. Изменение источника во время генерации приводит к `409`. После возврата ответа документ, конечно, может быть изменён; цитата содержит поколение, чтобы потребитель мог проверить актуальность.
+
+Локальный режим строит детерминированные хеш-векторы и отвечает фрагментом первого источника. Это средство для воспроизводимых тестов, а не оценка качества поиска или языковой модели. Внешний OpenAI-совместимый провайдер получает найденный текст как недоверенные данные и инструкцию цитировать источники. Приложение не может гарантировать, что сторонняя модель всегда последует этой инструкции; ответы требуют прикладной оценки.
+
+История запроса хранит версию промпта, провайдера, цитаты и задержку. Метрики отражают число принятых документов, запросов и время ответа. Метрики не заменяют внешнее наблюдение за очередями, БД и провайдером.

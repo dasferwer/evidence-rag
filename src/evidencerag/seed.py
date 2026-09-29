@@ -6,21 +6,24 @@ from sqlalchemy import select
 from evidencerag.db import session_factory
 from evidencerag.models import Document, KnowledgeBase, OutboxEvent
 
-CONTENT = """Critical incidents have a fifteen minute acknowledgement SLA.
+CONTENT = """Критический инцидент нужно подтвердить в течение пятнадцати минут.
 
-The incident commander opens a shared channel, appoints an owner and publishes
-updates every thirty minutes. If a recent deployment caused the incident,
-rollback is the preferred first mitigation. Customer communication must not
-contain unverified recovery estimates."""
+Ответственный открывает общий канал, назначает исполнителя и публикует обновления
+каждые тридцать минут. Если инцидент вызван недавним релизом, первым действием
+служит откат изменений. Клиентам нельзя сообщать неподтверждённые сроки восстановления."""
 
 
 async def seed() -> None:
     async with session_factory() as session:
         knowledge_base = await session.scalar(
-            select(KnowledgeBase).where(KnowledgeBase.slug == "operations-demo")
+            select(KnowledgeBase).where(
+                KnowledgeBase.slug == "operations-demo", KnowledgeBase.owner_id == "demo"
+            )
         )
         if knowledge_base is None:
-            knowledge_base = KnowledgeBase(name="Operations handbook", slug="operations-demo")
+            knowledge_base = KnowledgeBase(
+                name="Демонстрационная база", slug="operations-demo", owner_id="demo"
+            )
             session.add(knowledge_base)
             await session.flush()
 
@@ -34,7 +37,7 @@ async def seed() -> None:
             document = Document(
                 knowledge_base_id=knowledge_base.id,
                 source_key="incident-response-v1",
-                title="Incident response policy",
+                title="Порядок реагирования на инциденты",
                 content=CONTENT,
                 checksum=hashlib.sha256(CONTENT.encode()).hexdigest(),
             )
@@ -44,7 +47,7 @@ async def seed() -> None:
                 OutboxEvent(
                     aggregate_id=document.id,
                     event_type="document.ingest.requested",
-                    payload={"document_id": str(document.id)},
+                    payload={"document_id": str(document.id), "generation": document.generation},
                 )
             )
         await session.commit()

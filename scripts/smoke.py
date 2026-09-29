@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.error
 import urllib.request
 import uuid
 
-BASE_URL = "http://localhost:8081"
+BASE_URL = os.environ.get("EVIDENCERAG_SMOKE_URL", "http://localhost:8081")
+API_KEY = os.environ.get("EVIDENCERAG_API_KEY", "local-demo-key-change-me")
 
 
 def request(method: str, path: str, payload: dict[str, object] | None = None) -> dict[str, object]:
@@ -15,27 +17,36 @@ def request(method: str, path: str, payload: dict[str, object] | None = None) ->
         BASE_URL + path,
         data=data,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + API_KEY},
     )
     with urllib.request.urlopen(req, timeout=10) as response:
         return json.loads(response.read())
 
 
 def main() -> None:
+    for _ in range(40):
+        try:
+            request("GET", "/ready")
+            break
+        except (urllib.error.URLError, ConnectionError):
+            time.sleep(0.5)
+    else:
+        raise TimeoutError("API не стала доступной вовремя")
+
     suffix = uuid.uuid4().hex[:8]
     kb = request(
-        "POST", "/api/v1/knowledge-bases", {"name": "Operations handbook", "slug": f"ops-{suffix}"}
+        "POST", "/api/v1/knowledge-bases", {"name": "Порядок реагирования", "slug": f"ops-{suffix}"}
     )
     document = request(
         "POST",
         f"/api/v1/knowledge-bases/{kb['id']}/documents",
         {
             "source_key": f"incident-policy-{suffix}",
-            "title": "Incident response policy",
+            "title": "Порядок реагирования на инцидент",
             "content": (
-                "Critical incidents have a fifteen minute acknowledgement SLA. "
-                "The incident commander must open a shared channel and assign an owner. "
-                "If a deployment caused the incident, rollback is the preferred first action."
+                "Критический инцидент нужно подтвердить в течение пятнадцати минут. "
+                "Ответственный открывает общий канал и назначает исполнителя. "
+                "Если причиной стал релиз, первым действием служит откат изменений."
             ),
         },
     )
@@ -44,22 +55,22 @@ def main() -> None:
         if document["status"] == "ready":
             break
         if document["status"] == "failed":
-            raise RuntimeError(f"ingestion failed: {document['error']}")
+            raise RuntimeError(f"Индексация завершилась ошибкой: {document['error']}")
         time.sleep(0.5)
     else:
-        raise TimeoutError("document did not become ready")
+        raise TimeoutError("Документ не был проиндексирован вовремя")
 
     result = request(
         "POST",
         f"/api/v1/knowledge-bases/{kb['id']}/query",
-        {"question": "What is the acknowledgement SLA for critical incidents?", "top_k": 3},
+        {"question": "За сколько минут нужно подтвердить критический инцидент?", "top_k": 3},
     )
     assert result["citations"], result
     assert "[1]" in str(result["answer"]), result
     feedback = request(
         "POST",
         f"/api/v1/traces/{result['trace_id']}/feedback",
-        {"rating": 1, "comment": "grounded"},
+        {"rating": 1, "comment": "Ответ опирается на документ"},
     )
     assert feedback["rating"] == 1
     print(json.dumps({"status": "ok", "trace_id": result["trace_id"]}, indent=2))

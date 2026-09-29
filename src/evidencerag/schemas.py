@@ -15,11 +15,17 @@ class KnowledgeBaseRead(KnowledgeBaseCreate):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
+    owner_id: str
     created_at: datetime
 
 
 class DocumentCreate(BaseModel):
     source_key: str = Field(min_length=1, max_length=160)
+    title: str = Field(min_length=1, max_length=240)
+    content: str = Field(min_length=40, max_length=500_000)
+
+
+class DocumentRevision(BaseModel):
     title: str = Field(min_length=1, max_length=240)
     content: str = Field(min_length=40, max_length=500_000)
 
@@ -32,6 +38,8 @@ class DocumentRead(BaseModel):
     source_key: str
     title: str
     checksum: str
+    generation: int
+    indexed_generation: int | None
     status: DocumentStatus
     error: str | None
     created_at: datetime
@@ -45,6 +53,7 @@ class QueryRequest(BaseModel):
 
 class Citation(BaseModel):
     rank: int
+    generation: int
     document_id: uuid.UUID
     title: str
     source_key: str

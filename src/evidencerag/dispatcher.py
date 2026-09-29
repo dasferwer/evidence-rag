@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 async def dispatch_batch() -> int:
     connection = await connect()
     try:
-        channel = await connection.channel(publisher_confirms=True)
+        channel = await connection.channel(publisher_confirms=True, on_return_raises=True)
         exchange, _ = await declare_topology(channel)
         async with session_factory() as session, session.begin():
             statement = (
@@ -41,6 +41,7 @@ async def dispatch_batch() -> int:
                         delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                     ),
                     routing_key=ROUTING_KEY,
+                    mandatory=True,
                 )
                 event.published_at = utcnow()
                 event.attempts += 1
