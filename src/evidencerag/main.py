@@ -249,9 +249,12 @@ async def query_knowledge_base(
     owner_id: OwnerId,
 ) -> QueryResponse:
     await owned_kb(session, knowledge_base_id, owner_id)
+    # Сетевой вызов не должен удерживать транзакцию и соединение PostgreSQL.
+    await session.commit()
 
     started = time.perf_counter()
     query_vector = (await provider.embed([payload.question]))[0]
+    await owned_kb(session, knowledge_base_id, owner_id)
     retrieved = await retrieve(
         session,
         knowledge_base_id=knowledge_base_id,
@@ -262,6 +265,7 @@ async def query_knowledge_base(
     )
     await session.commit()
     answer = await provider.answer(payload.question, [item.text for item in retrieved])
+    await owned_kb(session, knowledge_base_id, owner_id)
     versions = {item.document_id: item.generation for item in retrieved}
     if versions:
         current = {
@@ -272,6 +276,7 @@ async def query_knowledge_base(
                     .where(Document.id.in_(versions))
                     .order_by(Document.id)
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             ).all()
         }

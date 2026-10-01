@@ -42,7 +42,36 @@ class AIProvider:
             "dimensions": self.settings.embedding_dimension,
         }
         response = await self._post("/embeddings", payload)
-        return [item["embedding"] for item in response["data"]]
+        error = "Некорректный ответ embedding-провайдера"
+        data = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(data, list) or len(data) != len(texts):
+            raise ValueError(error)
+        vectors: dict[int, list[float]] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                raise ValueError(error)
+            index, embedding = item.get("index"), item.get("embedding")
+            if (
+                type(index) is not int
+                or not 0 <= index < len(texts)
+                or index in vectors
+                or not isinstance(embedding, list)
+                or len(embedding) != self.settings.embedding_dimension
+            ):
+                raise ValueError(error)
+            vector = []
+            for value in embedding:
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(error)
+                try:
+                    number = float(value)
+                except OverflowError as exc:
+                    raise ValueError(error) from exc
+                if not math.isfinite(number):
+                    raise ValueError(error)
+                vector.append(number)
+            vectors[index] = vector
+        return [vectors[index] for index in range(len(texts))]
 
     async def answer(self, question: str, contexts: list[str]) -> str:
         if not contexts:

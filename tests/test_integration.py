@@ -6,13 +6,21 @@ import aio_pika
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
 from evidencerag.broker import DLQ_NAME, ROUTING_KEY, connect, declare_topology
 from evidencerag.config import get_settings
 from evidencerag.db import engine, session_factory
 from evidencerag.main import app
-from evidencerag.models import Chunk, Document, DocumentStatus, OutboxEvent, utcnow
+from evidencerag.models import (
+    Chunk,
+    Document,
+    DocumentStatus,
+    KnowledgeBase,
+    OutboxEvent,
+    QueryTrace,
+    utcnow,
+)
 from evidencerag.retrieval import retrieve
 from evidencerag.worker import handle_message, ingest_document
 
@@ -264,8 +272,162 @@ async def test_invalid_notification_goes_to_dlq():
         message = await queue.get(timeout=3)
         assert message is not None
         await handle_message(message)
-        rejected = await dlq.get(timeout=3)
-        assert rejected is not None and rejected.body == b"not-json"
-        await rejected.ack()
+        async with dlq.iterator() as incoming:
+            rejected = await asyncio.wait_for(anext(incoming), timeout=3)
+            assert rejected.body == b"not-json"
+            await rejected.ack()
     finally:
         await connection.close()
+
+
+@pytest.mark.parametrize("phase", ["embed", "answer"])
+async def test_external_query_calls_release_database_connection(client, monkeypatch, phase):
+    from evidencerag.main import provider
+
+    async with client:
+        kb, document = await make_document(client)
+        assert await ingest_document(UUID(document["id"]))
+        started, release = asyncio.Event(), asyncio.Event()
+        original = getattr(provider, phase)
+
+        async def slow(*args):
+            started.set()
+            await release.wait()
+            return await original(*args)
+
+        monkeypatch.setattr(provider, phase, slow)
+        task = asyncio.create_task(
+            client.post(
+                f"/api/v1/knowledge-bases/{kb['id']}/query",
+                headers=headers(),
+                json={"question": "Что делать при аварии?"},
+            )
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 5)
+            assert engine.pool.checkedout() == 0
+        finally:
+            release.set()
+            response = await asyncio.wait_for(task, 5)
+        assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("phase", ["embed", "answer"])
+async def test_query_rechecks_owner_after_external_call(client, monkeypatch, phase):
+    from evidencerag.main import provider
+
+    async with client:
+        kb, document = await make_document(client)
+        assert await ingest_document(UUID(document["id"]))
+        started, release = asyncio.Event(), asyncio.Event()
+        original = getattr(provider, phase)
+
+        async def slow(*args):
+            started.set()
+            await release.wait()
+            return await original(*args)
+
+        monkeypatch.setattr(provider, phase, slow)
+        task = asyncio.create_task(
+            client.post(
+                f"/api/v1/knowledge-bases/{kb['id']}/query",
+                headers=headers(),
+                json={"question": "Что делать при аварии?"},
+            )
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 5)
+            async with session_factory.begin() as session:
+                await session.execute(
+                    update(KnowledgeBase)
+                    .where(KnowledgeBase.id == UUID(kb["id"]))
+                    .values(owner_id="other")
+                )
+        finally:
+            release.set()
+            response = await asyncio.wait_for(task, 5)
+        assert response.status_code == 404, response.text
+        async with session_factory() as session:
+            assert (
+                await session.scalar(
+                    select(QueryTrace.id).where(QueryTrace.knowledge_base_id == UUID(kb["id"]))
+                )
+                is None
+            )
+
+
+async def test_query_rechecks_document_generation_after_answer(client, monkeypatch):
+    from evidencerag.main import provider
+
+    async with client:
+        kb, document = await make_document(client)
+        assert await ingest_document(UUID(document["id"]))
+        started, release = asyncio.Event(), asyncio.Event()
+        original = provider.answer
+
+        async def slow(*args):
+            started.set()
+            await release.wait()
+            return await original(*args)
+
+        monkeypatch.setattr(provider, "answer", slow)
+        task = asyncio.create_task(
+            client.post(
+                f"/api/v1/knowledge-bases/{kb['id']}/query",
+                headers=headers(),
+                json={"question": "Что делать при аварии?"},
+            )
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 5)
+            updated = await client.put(
+                f"/api/v1/documents/{document['id']}",
+                headers={**headers(), "If-Match": '"1"'},
+                json={"title": "Новая редакция", "content": "Новый порядок действий. " * 3},
+            )
+            assert updated.status_code == 200
+            assert await ingest_document(UUID(document["id"]))
+        finally:
+            release.set()
+            response = await asyncio.wait_for(task, 5)
+        assert response.status_code == 409, response.text
+        async with session_factory() as session:
+            assert (
+                await session.scalar(
+                    select(QueryTrace.id).where(QueryTrace.knowledge_base_id == UUID(kb["id"]))
+                )
+                is None
+            )
+
+
+async def test_invalid_embedding_batch_never_publishes_partial_chunks(client, monkeypatch):
+    from evidencerag import worker
+    from evidencerag.ai import AIProvider
+    from evidencerag.config import Settings
+
+    invalid_provider = AIProvider(
+        Settings(llm_provider="openai", openai_api_key="test-placeholder")
+    )
+
+    async def invalid_response(path, payload):
+        assert len(payload["input"]) > 1
+        data = [
+            {"index": index, "embedding": [0.5] * 384} for index in range(len(payload["input"]))
+        ]
+        data[-1]["index"] = 0
+        return {"data": data}
+
+    monkeypatch.setattr(invalid_provider, "_post", invalid_response)
+    monkeypatch.setattr(worker, "provider", invalid_provider)
+    async with client:
+        _, document = await make_document(client, content="Инструкция по восстановлению. " * 500)
+        document_id = UUID(document["id"])
+        assert await ingest_document(document_id) is False
+        async with session_factory() as session:
+            assert (
+                await session.scalar(select(Chunk.id).where(Chunk.document_id == document_id))
+                is None
+            )
+            stored = await session.get(Document, document_id)
+            assert stored.status == DocumentStatus.queued
+            assert stored.error == "ValueError"
